@@ -1,0 +1,1 @@
+jobs: dict[str, dict] = {}

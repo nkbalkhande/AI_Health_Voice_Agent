@@ -1,0 +1,256 @@
+llm:
+  provider: litellm
+  # Full LiteLLM model id — swap without code changes
+  # Pinned to Jul 15 all-4≥90 baseline. Do not swap mid-experiment.
+  # model: azure/gpt4o-hre-asknova-aiops-devtest-uks01
+  # model: openai/gpt-5.5
+  # model: azure/gpt4o-hre-asknova-aiops-devtest-uks01
+  # model: anthropic/claude-sonnet-4-5  (needs ANTHROPIC_API_KEY)
+  # Also the Docling page-reading (VLM) model when ingestion.use_vlm is true:
+  # openai/<model> calls OpenAI, azure/<deployment> calls Azure. Must accept images.
+  model: openai/gpt-4o
+  # model: azure/gpt4o-hre-asknova-aiops-devtest-uks01
+  # Hard ceiling on generated tokens. Never leave this null: reasoning models
+  # (GPT-5) can otherwise burn the entire context on hidden reasoning and return
+  # an empty answer.
+  max_completion_tokens: 8192
+  # Seconds per request. litellm's own default is 6000s, so a stalled
+  # connection hangs the caller for over an hour with no log line.
+  timeout: 300
+  kwargs: { }
+
+chunking:
+  strategy: semantic
+  semantic:
+    breakpoint_threshold_type: percentile
+    breakpoint_threshold_amount: 90
+    batch_size: 5
+    enrichment:
+      enabled: true
+      # One call per chunk, so a small model keeps cost down. Uses llm.model when null.
+      model: openai/gpt-4o-mini
+      max_completion_tokens: 1024
+      max_page_context_chars: 100000
+      include_neighbor_pages: true
+      concurrent_chunks: 10
+      # system_prompt: null
+
+embedding:
+  provider: litellm
+  # 3072 dims = qdrant.dense_dim. Changing the model requires re-ingesting the collection.
+  # Same model as the Azure embedv3 deployment (identical vectors, verified), so
+  # chunks ingested through Azure stay searchable.
+  model: text-embedding-3-large
+  # model: azure/embedv3-hre-asknova-aiops-devtest-uks01
+  max_tokens_per_request: 128000
+  max_batch_size: 20
+  # Seconds per embedding request; see llm.timeout. Semantic chunking issues
+  # one call per ~20 texts, so a stalled call blocks the whole ingest.
+  timeout: 60
+  # WARNING (R-39): provider "bge" is NOT a BGE model. It is a sha256-hash
+  # placeholder (app/infrastructure/embeddings/bge.py) - the vectors have no
+  # semantics and its 384 dims mismatch this collection's 3072. Likewise
+  # reranker.provider "bge" is a keyword-overlap stub. Dev scaffolding only;
+  # never use either for an evaluation run.
+  # provider: bge
+
+vectordb:
+  provider: qdrant
+  # Field Guide corpus (Aug 2026 ingest, XLSX sheet-as-page). Do not point
+  # evals at a new collection until re-ingest is verified (point count +
+  # embedding model match). Retired Jul 15 public corpus: RAG_audit_sementic_llm_chunks
+  collection: voice-agent
+  qdrant:
+    url: http://localhost:6333
+    dense_dim: 3072
+    timeout: 120
+    upsert_batch_size: 32
+    # Hybrid dense+sparse fusion. Defaults reproduce the pinned Jul 15 baseline
+    # exactly — do NOT change without an A/B eval on a separate collection.
+    hybrid_fusion: rrf          # rrf | dbsf (distribution-based score fusion)
+    prefetch_multiplier: 2      # per-arm candidate pool = top_k * this
+    search_exact: true          # true = brute-force (baseline); false = HNSW/ANN
+
+reranker:
+  provider: cohere
+  model: cohere/rerank-english-v3.0
+  # Cohere trial limit: 10 rerank calls / minute. Calls are throttled to stay under this.
+  # rate_limit_per_min: 10
+  rate_limit_per_min: 990
+  reranker_threshold: 0.45
+  # Always give the LLM at least this many chunks. When fewer pass the
+  # threshold, the gap is filled with the highest retrieval-score candidates
+  # (after dedup); they are marked "backfilled" in metadata and citations.
+  # 0 disables the floor.
+  min_context_chunks: 3
+  # R-19: reranker_threshold gates ADMISSION on raw Cohere relevance before
+  # fusion; the fused min-max score is used for RANKING only. Positional
+  # stand-in scores are never threshold-gated.
+  score_fusion:
+    enabled: true
+    # Channel weights: fused = retrieval_weight * retrieval_norm + rerank_weight * rerank_norm.
+    # Keep the sum at 1.0 so the fused RANKING score keeps its scale (R-52).
+    # Thresholding is unaffected (R-19: admission gates on raw relevance).
+    # Change only with an A/B eval.
+    retrieval_weight: 0.5
+    rerank_weight: 0.5
+
+retrieval:
+  strategy: hybrid
+  top_k: 25
+  rerank_top_k: 10
+
+authority_reordering:
+  # Audit-only (PCAOB, AICPA, ...). Off for the healthcare agent.
+  enabled: false
+  supported_authorities:
+    - PCAOB
+    - AICPA
+    - SEC
+    - IRS
+    - COSO
+    - FASB
+    - GASB
+    - FASAB
+
+preprocessing:
+  # Chunk preprocessing after retrieval, before reranking (deduplication only).
+  enabled: true
+  provider: embeddings
+  # Defaults to embedding.* when omitted.
+  # 0.90 threshold was tuned on text-embedding-3-large distances — keep in lockstep.
+  embedding:
+    provider: openai
+    model: text-embedding-3-large
+  redundant_similarity_threshold: 0.90
+
+compression:
+  # Contextual compression after reranking: extract only query-relevant spans
+  # from each chunk via an LLM (LangChain LLMChainExtractor).
+  enabled: true
+  # openai/<model> or azure/<deployment>
+  model: openai/gpt-4o-mini
+  # R-51: chunk_threshold was removed - it was never read by any code path.
+  # Relevance thresholding is reranker.reranker_threshold below, applied to
+  # the fused retrieval+rerank score.
+
+evaluation:
+  # ragas is the program standard: it is the only runner that scores
+  # answer_correctness against ground truth. Switch to deepeval locally for
+  # diagnostics only; do not commit the switch.
+  provider: ragas
+  # Shared judge for both ragas and deepeval (LiteLLM-style id).
+  # Prefer a non-reasoning judge (e.g. openai/gpt-4.1) for ragas: GPT-5.x
+  # needs max_completion_tokens and can return empty {} on Verification.
+  # Judge must differ from llm.model (generator) so the generator does not
+  # grade its own answers.
+  model: openai/gpt-4.1
+  temperature: 0
+  embedding_model: openai/text-embedding-3-large
+  ragas:
+    max_retries: 15
+    max_wait: 180
+    timeout: 180
+    max_workers: 5
+    # R-32 / R-49: AnswerRelevancy judge generations per sample. The ragas
+    # library default is 3, but ragas 0.4.x's InstructorLLM path (what
+    # llm_factory(client=...) returns) ignores n in generate_multiple and
+    # always produces ONE generation, so 1 records what actually happens.
+    # Values above 1 change nothing on this path; the manifest records it.
+    answer_relevancy_strictness: 1
+  deepeval:
+    max_concurrent: 15
+    evaluation_judge_max_tokens: 8192
+    per_attempt_timeout_seconds: 99999
+    per_task_timeout_seconds: 1800
+    retry_max_attempts: 10
+  artifacts_dir: ./data/results/artifacts
+
+
+ingestion:
+  # When true, Docling routes PDF + IMAGE through Azure OpenAI VlmPipeline.
+  # Other Docling formats (PPTX, DOCX, …) still use Docling’s default pipelines.
+  # Requires AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, and AZURE_OPENAI_DEPLOYMENT.
+  use_vlm: true
+  # Override Docling Azure VLM page→markdown prompt. Null uses
+  # app/rag/ingestion/vlm_prompt.py DEFAULT_VLM_PROMPT.
+  vlm_prompt: null
+  # Pages sent to the VLM at the same time. 1 = one page after another
+  # (~20s per page). Lower it if Azure returns 429 rate-limit errors.
+  vlm_concurrency: 8
+  # XLSX drawing layer. Text boxes are always rendered into the sheet text and
+  # every picture always gets an anchored placeholder (sheet + cells + nearest
+  # cell label) so the answer can point the user to the file. Set true to ALSO
+  # transcribe each picture with the vision LLM (llm.model via LiteLLM) into a
+  # separate image chunk.
+  xlsx_analyze_images: false
+
+logging:
+  level: INFO
+  file_path: ./metadata/logs/app.log
+
+audit:
+
+  backend: jsonl
+  path: ./data/audit/queries.jsonl
+
+chat:
+  # postgres keeps sessions after a restart. Tests force CHAT_STORE=memory.
+  store: postgres
+  max_history_messages: 20
+
+web_search:
+  # Runs beside document retrieval. A failure here still returns RAG evidence.
+  enabled: true
+  provider: serpapi
+  engine: google
+  # Google hl / gl. Without them results for health questions were off-topic.
+  language: en
+  country: in
+  max_results: 5
+  timeout_seconds: 12
+  # Optional hostname suffixes. Empty searches the open web.
+  # Example: ["mayoclinic.org", "nih.gov", "cdc.gov", "who.int"]
+  domains: []
+
+voice:
+  stt_provider: deepgram
+  stt_model: nova-3
+  tts_provider: deepgram   # deepgram | elevenlabs
+  deepgram_tts_model: aura-2-thalia-en
+  # Voices the UI may pick from (Deepgram only). Anything else falls back to
+  # deepgram_tts_model, so clients cannot request arbitrary models.
+  deepgram_tts_voices:
+    - {id: aura-2-thalia-en, label: Thalia, description: "Clear, confident (female)"}
+    - {id: aura-2-asteria-en, label: Asteria, description: "Warm, approachable (female)"}
+    - {id: aura-2-luna-en, label: Luna, description: "Friendly, natural (female)"}
+    - {id: aura-2-helena-en, label: Helena, description: "Caring, calm (female)"}
+    - {id: aura-2-andromeda-en, label: Andromeda, description: "Casual, expressive (female)"}
+    - {id: aura-2-apollo-en, label: Apollo, description: "Confident, comfortable (male)"}
+    - {id: aura-2-arcas-en, label: Arcas, description: "Natural, smooth (male)"}
+    - {id: aura-2-orion-en, label: Orion, description: "Approachable, calm (male)"}
+    - {id: aura-2-aries-en, label: Aries, description: "Warm, energetic (male)"}
+    - {id: aura-2-zeus-en, label: Zeus, description: "Deep, trustworthy (male)"}
+  # Live voice mode (hands-free). Lower endpointing answers sooner but can
+  # cut a speaker off mid-thought.
+  endpointing_ms: 400
+  utterance_end_ms: 1000
+  tts_sample_rate: 24000
+  # Optional model for query rewriting on voice turns only (it sits before
+  # retrieval on the path to first audio). Empty uses llm.model. Measured:
+  # gpt-4o-mini was no faster than gpt-4o here — API latency dominates.
+  understand_model: ""
+  elevenlabs_voice_id: 21m00Tcm4TlvDq8ikWAM
+  elevenlabs_model: eleven_flash_v2_5
+  timeout_seconds: 60
+
+agent:
+  # LangGraph state checkpoints in PostgreSQL, keyed by the session thread_id.
+  checkpointer: postgres
+
+redis:
+  # Temporary state and web-search cache. It fails open if Redis is down,
+  # so the API still answers without it.
+  enabled: true
+  url: redis://localhost:6379/0
+  web_cache_ttl_seconds: 300
